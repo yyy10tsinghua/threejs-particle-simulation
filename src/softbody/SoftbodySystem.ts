@@ -1,4 +1,5 @@
 import { instancedArray, uniform } from 'three/tsl';
+import type ComputeNode from 'three/src/nodes/gpgpu/ComputeNode.js';
 import type StorageBufferNode from 'three/src/nodes/accessors/StorageBufferNode.js';
 
 import {
@@ -11,6 +12,7 @@ import {
   type SolverContext,
 } from '../core/index.js';
 import { buildRotationKernels } from './rotation.js';
+import { releaseStorageBuffers } from '../core/particles.js';
 import {
   buildCenterOfMassKernel,
   buildMomentAndPolarDecompKernel,
@@ -18,11 +20,13 @@ import {
   buildShapeMatchDeltaApplyKernel,
 } from './shapeMatch.js';
 import {
+  buildEffectiveRestKernel,
   buildImplicitMomentPolarKernel,
   buildImplicitNeighborhoodCenterKernel,
   buildImplicitQpWriteKernel,
   buildImplicitResetPairLambdaKernel,
   buildImplicitShapeMatchScatterKernel,
+  buildPlasticRestKernel,
 } from './shapeMatchImplicit.js';
 
 /** One soft body: a block of particles that tries to keep its rest shape. */
@@ -121,6 +125,16 @@ export class SoftbodySystem implements Material {
    */
   readonly restOffsets: StorageBufferNode<'vec4'>;
 
+  /**
+   * Rest state the solver actually solves against: {@link restOffsets} with
+   * any plastic flow folded in. Identical in effect to `restOffsets` until a
+   * plastic field is attached, so bodies without one are unaffected.
+   */
+  private effectiveRest: StorageBufferNode<'vec4'> | undefined;
+  /** Neighborhood rest centroids matching {@link effectiveRest}. */
+  private effectiveCenters: StorageBufferNode<'vec4'> | undefined;
+  private plasticOffsets: StorageBufferNode<'vec4'> | undefined;
+
   private readonly defs: readonly SoftbodyDef[];
   private readonly selfCollision: boolean;
   private readonly bodyCompliance: StorageBufferNode<'float'>;
@@ -209,6 +223,42 @@ export class SoftbodySystem implements Material {
     return { start: body.range.start, count: body.surfaceCount };
   }
 
+  /**
+   * Attach a plastic field's displacement buffer, so permanently deformed
+   * material stays deformed.
+   *
+   * Without this the solver pulls every particle back toward its rest shape
+   * each iteration, which is why a purely positional cavity cannot survive.
+   * Folding the plastic offsets into the rest state makes the solver treat the
+   * crush channel as rearranged material. Skinning keeps the original bind
+   * coordinates and follows the displaced particles.
+   *
+   * Must be called before the simulation loop is built: the kernel list is
+   * assembled once.
+   */
+  attachPlasticFlow(offsets: StorageBufferNode<'vec4'>): void {
+    this.plasticOffsets = offsets;
+    this.effectiveRest = instancedArray(this.particles.capacity, 'vec4');
+    this.effectiveCenters = instancedArray(this.particles.capacity, 'vec4');
+  }
+
+  /**
+   * The rest-offset buffer consumers should read: the plastic-folded state
+   * when a plastic field is attached, the base rest state otherwise. Mesh
+   * binding still uses the original restOffsets.
+   */
+  get solverRestOffsets(): StorageBufferNode<'vec4'> {
+    return this.effectiveRest ?? this.restOffsets;
+  }
+
+  /** Release the optional plastic rest buffers after the loop has stopped. */
+  disposePlasticFlow(): void {
+    const buffers = [this.effectiveRest, this.effectiveCenters].filter(
+      (buffer): buffer is StorageBufferNode<'vec4'> => buffer !== undefined,
+    );
+    releaseStorageBuffers(this.particles.renderer, buffers);
+  }
+
   /** Change a body's shape-matching compliance. Takes effect on the next step. */
   setCompliance(index: number, compliance: number): void {
     this.body(index);
@@ -245,7 +295,7 @@ export class SoftbodySystem implements Material {
     const rotation = buildMomentAndPolarDecompKernel({
       ...shared,
       weights,
-      restOffsets: this.restOffsets,
+      restOffsets: this.solverRestOffsets,
       bodyRotations: this.bodyRotations,
     });
     return { shared, center, rotation };
@@ -255,15 +305,16 @@ export class SoftbodySystem implements Material {
     const { particles } = this;
     const lambda = instancedArray(particles.capacity, 'vec4');
     const { shared, center, rotation } = this.buildBodyFrameKernels();
+    const plastic = this.plasticKernels();
     return {
-      preSolve: [buildResetLambdaKernel({ particles, lambda })],
+      preSolve: [...plastic, buildResetLambdaKernel({ particles, lambda })],
       // Refit the body frame every iteration so other constraints' pushes carry the body along.
       solve: [
         center,
         rotation,
         buildShapeMatchDeltaApplyKernel({
           ...shared,
-          restOffsets: this.restOffsets,
+          restOffsets: this.solverRestOffsets,
           bodyCenters: this.bodyCenters,
           bodyRotations: this.bodyRotations,
           bodyCompliance: this.bodyCompliance,
@@ -294,12 +345,12 @@ export class SoftbodySystem implements Material {
       }
     }
 
-    const neighborOffsets = instancedArray(graph.offsets, 'uint');
-    const neighborIndices = instancedArray(graph.indices, 'uint');
     const particleCenters = instancedArray(particles.capacity, 'vec4');
     const particleRotations = instancedArray(3 * particles.capacity, 'vec4');
     const pairLambda = instancedArray(graph.indices.length, 'vec4');
     const accumulator = new Accumulator(particles, 10, 'shapeMatchCorrections');
+    const neighborOffsets = instancedArray(graph.offsets, 'uint');
+    const neighborIndices = instancedArray(graph.indices, 'uint');
     const shared = {
       particles,
       range: span,
@@ -307,10 +358,13 @@ export class SoftbodySystem implements Material {
       neighborIndices,
       particleCenters,
     };
+    // With a plastic field attached the solver must solve against the deformed
+    // rest state and its matching centroids; otherwise it drags the channel shut.
+    const folded = this.plasticKernels(restCenters, neighborOffsets, neighborIndices);
     const neighborhood = {
       ...shared,
-      restOffsets: this.restOffsets,
-      restNeighborhoodCenters: restCenters,
+      restOffsets: this.solverRestOffsets,
+      restNeighborhoodCenters: this.effectiveCenters ?? restCenters,
       particleRotations,
     };
     const center = buildImplicitNeighborhoodCenterKernel(shared);
@@ -324,6 +378,7 @@ export class SoftbodySystem implements Material {
 
     return {
       preSolve: [
+        ...folded,
         orientation.predict,
         buildImplicitResetPairLambdaKernel({ pairLambda, totalDegree: graph.indices.length }),
       ],
@@ -336,6 +391,48 @@ export class SoftbodySystem implements Material {
       ],
       postSolve: [orientation.advect, frame.center, frame.rotation],
     };
+  }
+
+  /**
+   * Kernels that fold a plastic field's flow into the rest state the solver
+   * uses. Empty when no plastic field is attached, so the fold is free for
+   * every existing preset.
+   *
+   * `baseCenters` is the CPU-computed neighborhood centroid buffer, used as
+   * the fallback for particles with no neighbors.
+   */
+  private plasticKernels(
+    baseCenters?: StorageBufferNode<'vec4'>,
+    neighborOffsets?: StorageBufferNode<'uint'>,
+    neighborIndices?: StorageBufferNode<'uint'>,
+  ): ComputeNode[] {
+    const { plasticOffsets, effectiveRest, effectiveCenters } = this;
+    if (!plasticOffsets || !effectiveRest) return [];
+    if (this.shapeMatching === 'global' || !baseCenters || !neighborOffsets || !neighborIndices) {
+      return [
+        buildPlasticRestKernel({
+          range: this.span,
+          restOffsets: this.restOffsets,
+          plastic: plasticOffsets,
+          effectiveRest,
+        }),
+      ];
+    }
+    // Local shape matching also needs the neighborhood centroids recomputed,
+    // or the objective's c̄ drifts from the flowed rest positions.
+    return [
+      buildEffectiveRestKernel({
+        particles: this.particles,
+        range: this.span,
+        restOffsets: this.restOffsets,
+        plastic: plasticOffsets,
+        restNeighborhoodCenters: baseCenters,
+        neighborOffsets,
+        neighborIndices,
+        effectiveRest,
+        effectiveCenters: effectiveCenters!,
+      }),
+    ];
   }
 
   private body(index: number): SoftbodyBody {

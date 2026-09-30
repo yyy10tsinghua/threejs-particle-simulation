@@ -42,6 +42,111 @@ export interface BuildImplicitNeighborhoodCenterKernelArgs {
   readonly particleCenters: StorageBufferNode<'vec4'>;
 }
 
+/**
+ * Fold the plastic offsets into the rest state the solver solves against.
+ *
+ * `restOffsets` is the body-local rest position of every particle with the
+ * body's compliance in `w`. Deforming it in place would be the obvious way to
+ * make the crush channel permanent, but compliance lives in the same buffer,
+ * and the moment and skin shaders read the same record. Writing a separate
+ * effective copy keeps the compliance readable and lets the base rest state
+ * stay intact, which is what {@link reset} restores.
+ *
+ * `plastic` holds each particle's radial displacement away from the track, so
+ * adding it to the rest position is the rest-frame statement of "this material
+ * has been pushed aside to make room for the channel". The displacement is a
+ * volume-preserving map, so the lattice stays uniform and shape matching is
+ * not fighting a compressed rest shape.
+ */
+export interface BuildEffectiveRestKernelArgs {
+  readonly particles: ParticleSystem;
+  readonly range: ParticleRange;
+  readonly restOffsets: StorageBufferNode<'vec4'>;
+  /** Per-particle radial plastic displacement in `.xyz` from the track; zero when undeformed. */
+  readonly plastic: StorageBufferNode<'vec4'>;
+  /** Previous rest centroid, used to re-center the displaced state. */
+  readonly restNeighborhoodCenters: StorageBufferNode<'vec4'>;
+  readonly neighborOffsets: StorageBufferNode<'uint'>;
+  readonly neighborIndices: StorageBufferNode<'uint'>;
+  /** Output: the rest state the solver and skin should use. */
+  readonly effectiveRest: StorageBufferNode<'vec4'>;
+  /** Output: the rest centroid of each particle's neighborhood, matching `effectiveRest`. */
+  readonly effectiveCenters: StorageBufferNode<'vec4'>;
+}
+
+export function buildEffectiveRestKernel(
+  args: BuildEffectiveRestKernelArgs,
+): ComputeNode {
+  const {
+    particles,
+    range,
+    restOffsets,
+    plastic,
+    restNeighborhoodCenters,
+    neighborOffsets,
+    neighborIndices,
+    effectiveRest,
+    effectiveCenters,
+  } = args;
+  void particles;
+
+  return Fn(() => {
+    const i: Any = instanceIndex.add(uint(range.start));
+    // Carry the flowed rest position into the effective copy. The offset is in
+    // the body's rest frame, which for a pinned, axis-aligned block is the same
+    // as world space; the body's own rigid motion is not part of it.
+    const base: Any = restOffsets.element(i);
+    const flow: Any = plastic.element(i).xyz;
+    effectiveRest.element(i).assign(vec4(base.xyz.add(flow), base.w));
+
+    // Re-derive the neighborhood centroid from the displaced rest state, so the
+    // shape-matching objective tracks the flowed material rather than snapping
+    // back to where it used to be.
+    const start: Any = neighborOffsets.element(i).toVar();
+    const end: Any = neighborOffsets.element(i.add(uint(1))).toVar();
+    const count: Any = end.sub(start).toVar();
+    const sum: Any = vec3(0.0, 0.0, 0.0).toVar();
+    Loop({ start: start, end: end, type: 'uint', condition: '<' }, ({ i: k }: { i: Any }) => {
+      const j: Any = neighborIndices.element(k);
+      sum.addAssign(restOffsets.element(j).xyz.add(plastic.element(j).xyz));
+    });
+    const safeCount: Any = count.max(uint(1));
+    const c: Any = sum.div(safeCount.toFloat());
+    const isEmpty: Any = count.equal(uint(0));
+    const fallback: Any = restNeighborhoodCenters.element(i).xyz;
+    effectiveCenters
+      .element(i)
+      .assign(vec4(isEmpty.select(fallback, c), float(0.0)));
+  })()
+    .compute(range.count)
+    .setName('shapeMatchImplicit.effectiveRest');
+}
+
+/**
+ * The plastic fold for a system without a neighbor graph (global shape
+ * matching): carry the radial flow into the rest state and stop there. The
+ * body's rest centroid is recomputed on the CPU path from this buffer, so no
+ * centroid output is needed.
+ */
+export interface BuildPlasticRestKernelArgs {
+  readonly range: ParticleRange;
+  readonly restOffsets: StorageBufferNode<'vec4'>;
+  /** Per-particle radial plastic displacement in `.xyz` from the track. */
+  readonly plastic: StorageBufferNode<'vec4'>;
+  readonly effectiveRest: StorageBufferNode<'vec4'>;
+}
+
+export function buildPlasticRestKernel(args: BuildPlasticRestKernelArgs): ComputeNode {
+  const { range, restOffsets, plastic, effectiveRest } = args;
+  return Fn(() => {
+    const i: Any = instanceIndex.add(uint(range.start));
+    const base: Any = restOffsets.element(i);
+    effectiveRest.element(i).assign(vec4(base.xyz.add(plastic.element(i).xyz), base.w));
+  })()
+    .compute(range.count)
+    .setName('shapeMatchImplicit.plasticRest');
+}
+
 /** Step 1: each group's center `c_i`, the mean of its members' predicted positions. */
 export function buildImplicitNeighborhoodCenterKernel(
   args: BuildImplicitNeighborhoodCenterKernelArgs,

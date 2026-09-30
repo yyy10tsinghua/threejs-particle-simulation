@@ -1,6 +1,6 @@
-import { Color, Vector3 } from 'three';
+import { Color, DoubleSide, Vector3 } from 'three';
 import type { MeshStandardMaterial } from 'three';
-import { MeshStandardNodeMaterial } from 'three/webgpu';
+import { MeshPhysicalNodeMaterial, MeshStandardNodeMaterial } from 'three/webgpu';
 import {
   If,
   Fn,
@@ -44,6 +44,37 @@ export interface CreateSoftbodySkinMaterialOptions {
    * the skin material. The geometry needs uvs for the maps to show.
    */
   readonly sourceMaterial?: MeshStandardMaterial;
+  /**
+   * Optical settings for a translucent body. When `transmission` is above 0
+   * the skin is built as a physical material and refracts what is behind it.
+   */
+  readonly optical?: SkinOpticalOptions;
+}
+
+/**
+ * Optical settings for a translucent skin, e.g. ballistic gelatin. These are
+ * the physically meaningful controls for a refracting medium: `transmission`
+ * how much light passes through, `thickness` the distance it travels inside
+ * the body before absorption, `ior` its refractive index, and the attenuation
+ * pair the colour it takes on along the way.
+ */
+export interface SkinOpticalOptions {
+  /** Fraction of light transmitted, 0-1. Above 0 switches to a physical material. */
+  readonly transmission: number;
+  /** Body thickness in world units used for refraction and absorption. */
+  readonly thickness: number;
+  /** Refractive index. Water-clear gel is ~1.33; ordnance gelatin ~1.35. */
+  readonly ior?: number;
+  /** Distance over which light is attenuated to `attenuationColor`, in world units. */
+  readonly attenuationDistance?: number;
+  /** Tint light takes on as it travels through the interior. */
+  readonly attenuationColor?: Color;
+  /** Interior roughness; a smooth gel keeps this low. */
+  readonly roughness?: number;
+  /** Base albedo of the medium. */
+  readonly color?: Color;
+  /** Optional transparency for inspecting embedded surfaces. */
+  readonly opacity?: number;
 }
 
 export function createSoftbodySkinMaterial(
@@ -133,11 +164,35 @@ export function createSoftbodySkinMaterial(
     };
   }
 
-  const material = new MeshStandardNodeMaterial({
-    color: new Color(0xd07030),
-    roughness: 0.6,
-    metalness: 0,
-  });
+  // A translucent medium needs the physical material: `MeshPhysicalNodeMaterial`
+  // extends the standard one and is the only place `transmission`, `thickness`,
+  // `ior` and the attenuation pair are wired into the node pipeline.
+  const optical = options.optical;
+  const translucent = !!optical && optical.transmission > 0;
+  const material = translucent
+    ? new MeshPhysicalNodeMaterial({
+        color: optical.color ? optical.color.clone() : new Color(0xd07030),
+        roughness: optical.roughness ?? 0.12,
+        metalness: 0,
+        transmission: optical.transmission,
+        thickness: optical.thickness,
+        ior: optical.ior ?? 1.35,
+        attenuationDistance: optical.attenuationDistance ?? Infinity,
+        attenuationColor: optical.attenuationColor
+          ? optical.attenuationColor.clone()
+          : new Color(1, 1, 1),
+        // A gel body is a single closed surface; one refraction layer is enough
+        // and keeps the cost down at high particle counts.
+        transparent: true,
+        // Light entering and leaving through one surface; the far wall would
+        // double the refraction cost for no visible gain on a convex block.
+        side: DoubleSide,
+      })
+    : new MeshStandardNodeMaterial({
+        color: new Color(0xd07030),
+        roughness: 0.6,
+        metalness: 0,
+      });
 
   // Honour a glTF source material — copy PBR scalars + every texture
   // map slot the upstream `MeshStandardMaterial` exposes. Three.js's
@@ -163,8 +218,19 @@ export function createSoftbodySkinMaterial(
     }
   }
 
+  if (optical) {
+    if (optical.color) material.color.copy(optical.color);
+    if (optical.roughness !== undefined) material.roughness = optical.roughness;
+    if (optical.opacity !== undefined) {
+      material.opacity = optical.opacity;
+      material.depthWrite = optical.opacity >= 1;
+    }
+  }
+
   const skinArgs = {
     particles: softbody.particles,
+    // Vertices remain bound to the original geometry. Subtracting the flowed
+    // rest state here would cancel the plastic displacement in the skin.
     restOffsets: softbody.restOffsets,
     cBar: cBarUniform,
     createGetRotationQuat,

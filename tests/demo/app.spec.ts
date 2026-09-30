@@ -15,6 +15,7 @@ const presetIds = [
   'velvet-drape',
   'tarp-runoff',
   'vortex-plume',
+  'ballistic-gel',
 ];
 
 async function ready(page: Page): Promise<void> {
@@ -24,7 +25,7 @@ async function ready(page: Page): Promise<void> {
   await expect(page.locator('#fps')).not.toHaveText('—');
 }
 
-test('all thirteen presets render, advance, and switch without browser errors', async ({
+test('all fourteen presets render, advance, and switch without browser errors', async ({
   page,
 }) => {
   const errors: string[] = [];
@@ -33,7 +34,7 @@ test('all thirteen presets render, advance, and switch without browser errors', 
     if (message.type() === 'error') errors.push(message.text());
   });
   await page.goto('/');
-  await expect(page.locator('[data-preset]')).toHaveCount(13);
+  await expect(page.locator('[data-preset]')).toHaveCount(14);
   for (const id of presetIds) {
     await page.locator(`[data-preset="${id}"]`).click();
     await ready(page);

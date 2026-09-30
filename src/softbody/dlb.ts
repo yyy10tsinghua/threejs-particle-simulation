@@ -76,9 +76,9 @@ export interface BuildSkinPositionFnArgs {
   /** Owning particle system; used for `positions.element(idx)` reads. */
   readonly particles: ParticleSystem;
   /**
-   * Per-particle pre-centered body-local rest offsets (the
-   * {@link SoftbodySystem.restOffsets} buffer). Indexed by global
-   * particle slot.
+   * Per-particle pre-centered body-local rest offsets, indexed by global
+   * particle slot. These are the original bind offsets, even if the solver's
+   * rest state has subsequently changed through plastic flow.
    */
   readonly restOffsets: StorageBufferNode<'vec4'>;
   /**

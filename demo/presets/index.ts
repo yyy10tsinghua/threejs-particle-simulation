@@ -8,6 +8,7 @@ import { buildCloth, buildClothDrop } from './silk.js';
 import { buildVortex } from './vortex.js';
 import { buildDamBreak } from './dambreak.js';
 import { buildTarp } from './tarp.js';
+import { buildPenetration, gelatinV50 } from './penetration.js';
 
 const gravity = (value = 9.81): Control => ({
   key: 'gravity',
@@ -517,6 +518,61 @@ export const presets: readonly Preset[] = [
       },
     ],
     build: buildVortex,
+  },
+  {
+    id: 'ballistic-gel',
+    number: '14',
+    name: 'Ballistic Gel',
+    category: 'IMPACT & DEFORMATION',
+    group: 'Soft Body',
+    description:
+      `9 mm projectile / 10% gelatin / 0.76 m block. `
+      + `Nominal perforation threshold: ${Math.round(gelatinV50())} m/s.`,
+    accent: '#76e0cc',
+    camera: [0.75, 0.65, 2.15],
+    target: [0, 0.23, 0],
+    duration: 14,
+    controls: [
+      {
+        key: 'speed',
+        label: 'Impact speed',
+        description:
+          'Speed of the round as it meets the block. This is what decides the shot: the '
+          + 'track is deeper than the block, or it is not.',
+        min: 150,
+        max: 750,
+        step: 10,
+        value: 400,
+        unit: 'm/s',
+        restart: true,
+      },
+      {
+        key: 'softness',
+        label: 'Gel compliance',
+        description:
+          'How freely the gel wall moves once it is pushed. Affects how the cavity '
+          + 'reads, not how deep the round goes.',
+        min: 0,
+        max: 1,
+        step: 0.05,
+        value: 0.55,
+        unit: '0–1',
+        restart: true,
+      },
+      {
+        key: 'density',
+        label: 'Gel density',
+        description: 'Mass density used when the gel particles are created.',
+        min: 700,
+        max: 1400,
+        step: 10,
+        value: 1030,
+        unit: 'kg/m³',
+        restart: true,
+      },
+    ],
+    particleCounts: { low: 6000, medium: 10000, high: 15000, ultra: 20000, max: 30000 },
+    build: buildPenetration,
   },
 ];
 

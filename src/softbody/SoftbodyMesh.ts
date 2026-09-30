@@ -2,7 +2,7 @@ import { Mesh, type BufferGeometry, type MeshStandardMaterial } from 'three';
 import type { MeshStandardNodeMaterial } from 'three/webgpu';
 
 import { bindSoftbodyMesh } from './bindMesh.js';
-import { createSoftbodySkinMaterial } from './skinMaterial.js';
+import { createSoftbodySkinMaterial, type SkinOpticalOptions } from './skinMaterial.js';
 import type { SoftbodySystem } from './SoftbodySystem.js';
 
 /**
@@ -20,12 +20,18 @@ export class SoftbodyMesh extends Mesh<BufferGeometry, MeshStandardNodeMaterial>
   /**
    * @param material Colors and maps to copy onto the skinned material.
    *   Default: a plain orange-brown standard material.
+   * @param optical Optical settings for a translucent body. With
+   *   `transmission` above 0 the skin becomes a physical material that
+   *   refracts whatever is behind it, which is what separates gelatin from a
+   *   plastic box at reduced opacity. When given, these win over the
+   *   corresponding scalars on `material`.
    */
   constructor(
     softbody: SoftbodySystem,
     bodyIndex: number,
     geometry: BufferGeometry,
     material?: MeshStandardMaterial,
+    optical?: SkinOpticalOptions,
   ) {
     bindSoftbodyMesh(geometry, softbody, bodyIndex);
     super(
@@ -34,6 +40,7 @@ export class SoftbodyMesh extends Mesh<BufferGeometry, MeshStandardNodeMaterial>
         softbody,
         bodyIndex,
         ...(material ? { sourceMaterial: material } : {}),
+        ...(optical ? { optical } : {}),
       }),
     );
     this.softbody = softbody;

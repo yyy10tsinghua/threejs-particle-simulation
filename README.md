@@ -73,6 +73,7 @@ npm run dev
 | **Velvet Drape**      | A square of red velvet dropped onto the Stanford bunny                           |
 | **Tarp Runoff**       | Red liquid pouring onto a sloped canvas tarp and spilling off its edge           |
 | **Vortex Plume**      | A heated vent drives a buoyant, swirling plume that carries lit volumetric smoke |
+| **Ballistic Gel**     | A fast projectile punches through a deformable gel block and the cavity rebounds |
 
 | Control        | Action                           |
 | -------------- | -------------------------------- |
